@@ -44,7 +44,7 @@ ASR_MODEL_NAME: str = "openai/whisper-medium"  # Whisper checkpoint name
 
 # OpenAI / reranking
 OPENAI_MODEL: str = "gpt-4o"
-PARAPHRASE_COUNT: int = 5  # max query rewrites
+PARAPHRASE_COUNT: int = 3  # max query rewrites
 RERANK_DEPTH: int = 25  # top‑N sent to GPT for rerank
 
 # LLM Prompt Instructions
@@ -56,13 +56,14 @@ QUERY_EXPANSION_PROMPT: str = (
 
 RERANK_PROMPT: str = (
     "You are a video search ranking assistant. Given the user query and candidate "
-    "results, reorder them from most relevant to least relevant based on the query."
+    "results, reorder them from most relevant to least relevant based on the query. "
+    "Return only the IDs in the correct order."
 )
 
 # ANN search
 TOP_K: int = 10  # default number of hits returned
 HNSW_DISTANCE: str = "Cosine"
-JOINT_DIM: int = 512  # Both CLIP and CLAP use 512 dimensions - no truncation needed
+EMBEDDING_DIM: int = 512  # Both CLIP and CLAP use 512 dimensions
 
 # Logging config
 logging.basicConfig(
@@ -102,19 +103,11 @@ class QueryExpansion(BaseModel):
     )
 
 
-class RankingEntry(BaseModel):
-    """Individual ranking entry."""
-
-    id: str = Field(description="Unique identifier for the result")
-    snippet: str = Field(description="Text snippet or transcript")
-    score: float = Field(description="Relevance score")
-
-
 class RankingResult(BaseModel):
     """Model for reranked search results."""
 
-    results: list[RankingEntry] = Field(
-        description="List of results ordered from most relevant to least relevant"
+    ids: list[str] = Field(
+        description="List of result IDs ordered from most relevant to least relevant"
     )
 
 
@@ -137,13 +130,18 @@ class QdrantCfg:
 
 @dataclass(slots=True)
 class ModelBundle:
-    tok: AutoTokenizer
-    vis_proc: AutoImageProcessor
-    shared_model: AutoModel
-    clap: ClapModel
-    clap_proc: ClapProcessor
+    # CLIP model for both text and vision encoding
+    clip_tokenizer: AutoTokenizer
+    clip_processor: AutoImageProcessor
+    clip_model: AutoModel
+
+    # Audio encoding (CLAP)
+    clap_model: ClapModel
+    clap_processor: ClapProcessor
+
+    # Speech recognition (Whisper)
     whisper_model: WhisperForConditionalGeneration
-    whisper_proc: WhisperProcessor
+    whisper_processor: WhisperProcessor
 
 
 def load_models(device: torch.device = DEVICE) -> ModelBundle:
@@ -151,10 +149,10 @@ def load_models(device: torch.device = DEVICE) -> ModelBundle:
 
     # Load CLIP model for text and vision encoding
     LOGGER.info("Loading CLIP model: %s", CLIP_MODEL_NAME)
-    tok = AutoTokenizer.from_pretrained(CLIP_MODEL_NAME)
-    vis_proc = AutoImageProcessor.from_pretrained(CLIP_MODEL_NAME)
-    shared_model = AutoModel.from_pretrained(CLIP_MODEL_NAME)
-    shared_model.to(device).eval()
+    clip_tokenizer = AutoTokenizer.from_pretrained(CLIP_MODEL_NAME)
+    clip_processor = AutoImageProcessor.from_pretrained(CLIP_MODEL_NAME)
+    clip_model = AutoModel.from_pretrained(CLIP_MODEL_NAME)
+    clip_model.to(device).eval()
 
     # CLAP audio encoder
     LOGGER.info("Loading CLAP model: %s", CLAP_MODEL_NAME)
@@ -175,13 +173,13 @@ def load_models(device: torch.device = DEVICE) -> ModelBundle:
     whisper_proc = WhisperProcessor.from_pretrained(ASR_MODEL_NAME)
 
     return ModelBundle(
-        tok=tok,
-        vis_proc=vis_proc,
-        shared_model=shared_model,
-        clap=clap,
-        clap_proc=clap_proc,
+        clip_tokenizer=clip_tokenizer,
+        clip_processor=clip_processor,
+        clip_model=clip_model,
+        clap_model=clap,
+        clap_processor=clap_proc,
         whisper_model=whisper_model,
-        whisper_proc=whisper_proc,
+        whisper_processor=whisper_proc,
     )
 
 
@@ -327,7 +325,11 @@ def get_qdrant(cfg: QdrantCfg) -> QdrantClient:
 def ensure_collection(client: QdrantClient, cfg: QdrantCfg) -> None:
     if cfg.collection in {c.name for c in client.get_collections().collections}:
         return
-    vectors = {"joint": qmodels.VectorParams(size=JOINT_DIM, distance=HNSW_DISTANCE)}
+    vectors = {
+        "text": qmodels.VectorParams(size=EMBEDDING_DIM, distance=HNSW_DISTANCE),
+        "audio": qmodels.VectorParams(size=EMBEDDING_DIM, distance=HNSW_DISTANCE),
+        "vision": qmodels.VectorParams(size=EMBEDDING_DIM, distance=HNSW_DISTANCE),
+    }
     client.create_collection(cfg.collection, vectors_config=vectors)
     LOGGER.info("Created qdrant collection '%s'", cfg.collection)
 
@@ -356,7 +358,12 @@ def expand_query(query: str, n: int = PARAPHRASE_COUNT) -> list[str]:
 
 def llm_rerank(query: str, hits: list[dict]) -> list[dict]:
     candidates = [
-        {"id": h["id"], "snippet": h.get("transcript", "") or "", "score": h["score"]}
+        {
+            "id": h["id"],
+            "type": h["type"],
+            "snippet": h.get("transcript", h.get("video_id", "")),
+            "score": h["score"],
+        }
         for h in hits[:RERANK_DEPTH]
     ]
 
@@ -369,8 +376,8 @@ def llm_rerank(query: str, hits: list[dict]) -> list[dict]:
             text_format=RankingResult,
         )
 
-        ordered = response.output_parsed.results
-        pos = {o.id: i for i, o in enumerate(ordered)}
+        ordered = response.output_parsed.ids
+        pos = {o: i for i, o in enumerate(ordered)}
         return sorted(hits, key=lambda h: pos.get(h["id"], 1e9))
     except Exception:
         LOGGER.exception("LLM rerank failed – falling back to ANN order")
@@ -388,14 +395,16 @@ def ingest_single_video(
     """Ingest a single video file."""
     vid_id = video.stem
     scenes = detect_scenes(video)
-    joint_vectors: list[np.ndarray] = []
+    text_vectors: list[np.ndarray] = []
+    audio_vectors: list[np.ndarray] = []
+    vision_vectors: list[np.ndarray] = []
 
     for sid, (st, et) in enumerate(tqdm(scenes, desc=f"{vid_id} scenes")):
         frames = sample_frames(video, st, et)
-        vis_inp = models.vis_proc(images=frames, return_tensors="pt").to(DEVICE)
+        vis_inp = models.clip_processor(images=frames, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
             # Use CLIP vision encoding
-            vvec = models.shared_model.get_image_features(**vis_inp).mean(dim=0).cpu().numpy()
+            vvec = models.clip_model.get_image_features(**vis_inp).mean(dim=0).cpu().numpy()
 
         with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
             ffmpeg_extract_audio(video, Path(tmp.name), st, et)
@@ -404,12 +413,14 @@ def ingest_single_video(
             wav_for_whisper, sr = librosa.load(tmp.name, sr=16000)
 
             # Process audio for Whisper
-            inputs = models.whisper_proc(wav_for_whisper, sampling_rate=16000, return_tensors="pt")
+            inputs = models.whisper_processor(
+                wav_for_whisper, sampling_rate=16000, return_tensors="pt"
+            )
 
             # Generate transcription
             with torch.no_grad():
                 predicted_ids = models.whisper_model.generate(inputs["input_features"])
-                transcript = models.whisper_proc.batch_decode(
+                transcript = models.whisper_processor.batch_decode(
                     predicted_ids, skip_special_tokens=True
                 )[0].strip()
 
@@ -420,31 +431,32 @@ def ingest_single_video(
                 wav = wav.unsqueeze(0)  # Add batch dimension for consistency
 
         # text vector
-        tinp = models.tok(
+        tinp = models.clip_tokenizer(
             transcript or " ", return_tensors="pt", max_length=77, truncation=True
         ).to(DEVICE)
         with torch.no_grad():
             # Use CLIP text encoding
-            tvec = models.shared_model.get_text_features(**tinp).squeeze().cpu().numpy()
+            tvec = models.clip_model.get_text_features(**tinp).squeeze().cpu().numpy()
 
         # audio vector
         with torch.no_grad():
             # Use HuggingFace CLAP processor and model
-            audio_inputs = models.clap_proc(audios=[wav.squeeze().numpy()], return_tensors="pt").to(
-                DEVICE
-            )
-            avec = models.clap.get_audio_features(**audio_inputs).squeeze().cpu().numpy()
+            audio_inputs = models.clap_processor(
+                audios=[wav.squeeze().numpy()], return_tensors="pt"
+            ).to(DEVICE)
+            avec = models.clap_model.get_audio_features(**audio_inputs).squeeze().cpu().numpy()
 
-        # All embeddings are now 512 dimensions - no truncation needed
-        joint = (vvec + tvec + avec) / 3
-        joint_vectors.append(joint)
+        # Store separate vectors for pooling
+        text_vectors.append(tvec)
+        audio_vectors.append(avec)
+        vision_vectors.append(vvec)
 
         client.upsert(
             cfg.collection,
             [
                 qmodels.PointStruct(
                     id=str(uuid.uuid4()),
-                    vector={"joint": joint.tolist()},
+                    vector={"text": tvec.tolist(), "audio": avec.tolist(), "vision": vvec.tolist()},
                     payload={
                         "type": "chunk",
                         "scene_key": f"{vid_id}_sc{sid:04d}",
@@ -452,22 +464,27 @@ def ingest_single_video(
                         "scene_id": sid,
                         "start": round(st, 2),
                         "end": round(et, 2),
+                        "duration": round(et - st, 2),
                         "transcript": transcript,
                     },
                 )
             ],
         )
 
-    # full‑video pooled vector
+    # full‑video pooled vectors
     client.upsert(
         cfg.collection,
         [
             qmodels.PointStruct(
                 id=str(uuid.uuid4()),
-                vector={"joint": pool(joint_vectors).tolist()},
+                vector={
+                    "text": pool(text_vectors).tolist(),
+                    "audio": pool(audio_vectors).tolist(),
+                    "vision": pool(vision_vectors).tolist(),
+                },
                 payload={
                     "type": "full",
-                    "scene_key": vid_id,
+                    "scene_key": f"{vid_id}_full",
                     "video_id": vid_id,
                     "duration": round(scenes[-1][1], 2),
                 },
@@ -501,10 +518,32 @@ def ingest(input_path: str, cfg: QdrantCfg) -> None:
 # ────────────────────────────────────────────────────────────────────────────────
 
 
-def embed_text(query: str, models: ModelBundle) -> np.ndarray:
-    inp = models.tok(query, return_tensors="pt", max_length=77, truncation=True).to(DEVICE)
+def embed_query(query: str, models: ModelBundle) -> dict[str, np.ndarray]:
+    """Create embeddings for each modality from a text query."""
+    embeddings = {}
+
+    # Text embedding using CLIP text encoder
+    text_input = models.clip_tokenizer(
+        query, return_tensors="pt", max_length=77, truncation=True
+    ).to(DEVICE)
     with torch.no_grad():
-        return models.shared_model.get_text_features(**inp).squeeze().cpu().numpy()
+        embeddings["text"] = (
+            models.clip_model.get_text_features(**text_input).squeeze().cpu().numpy()
+        )
+
+    # Vision embedding using CLIP text encoder (cross-modal search)
+    # CLIP is designed so text and vision embeddings are in the same space
+    embeddings["vision"] = embeddings["text"]  # Same embedding space for cross-modal search
+
+    # Audio embedding using CLAP text encoder
+    with torch.no_grad():
+        # CLAP also supports text input for cross-modal audio search
+        audio_input = models.clap_processor(text=[query], return_tensors="pt").to(DEVICE)
+        embeddings["audio"] = (
+            models.clap_model.get_text_features(**audio_input).squeeze().cpu().numpy()
+        )
+
+    return embeddings
 
 
 def search(query: str, cfg: QdrantCfg, limit: int = TOP_K) -> None:
@@ -515,31 +554,35 @@ def search(query: str, cfg: QdrantCfg, limit: int = TOP_K) -> None:
     union: dict[str, dict] = {}
 
     for q in expanded:
-        qvec = embed_text(q, models)
-        hits = client.search(
-            cfg.collection,
-            ("joint", qvec),
-            limit=limit,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for h in hits:
-            entry = union.setdefault(h.id, {"payload": h.payload, "sum": 0.0, "cnt": 0})
-            entry["sum"] += h.score
-            entry["cnt"] += 1
+        # Get text embedding and search text vectors
+        qvec = embed_query(q, models)
 
-    scored = [
-        {
-            "id": p["payload"].get("scene_key", uid),
-            "video_id": p["payload"].get("video_id", uid),
-            "type": p["payload"].get("type"),
-            "start": p["payload"].get("start"),
-            "end": p["payload"].get("end"),
-            "score": round(p["sum"] / p["cnt"], 4),
-            "transcript": (p["payload"].get("transcript") or "")[:80],
-        }
-        for uid, p in union.items()
-    ]
+        # Search across all three modalities
+        for vector_name in ["text", "audio", "vision"]:
+            hits = client.search(
+                cfg.collection,
+                (vector_name, qvec[vector_name]),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            for h in hits:
+                # Deduplicate hits and aggregate scores
+                entry = union.setdefault(h.id, {"payload": h.payload, "sum": 0.0, "cnt": 0})
+                entry["sum"] += h.score
+                entry["cnt"] += 1
+
+    scored = []
+    for uid, p in union.items():
+        scored.append(
+            {
+                "id": uid,
+                **p["payload"],
+                "score": round(p["sum"] / p["cnt"], 4),
+            }
+        )
+
     scored.sort(key=lambda d: d["score"], reverse=True)
 
     ranked = llm_rerank(query, scored)
